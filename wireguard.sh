@@ -2,13 +2,18 @@
 #
 # This is a Shell script for configure and start WireGuard VPN server.
 #
-# Copyright (C) 2019 Teddysun <i@teddysun.com>
+# Copyright (C) 2019 - 2020 Teddysun <i@teddysun.com>
 #
 # Reference URL:
 # https://www.wireguard.com
 # https://git.zx2c4.com/WireGuard
+# https://teddysun.com/554.html
 
 trap _exit INT QUIT TERM
+
+cur_dir="$(cd -P -- "$(dirname -- "$0")" && pwd -P)"
+
+[ ${EUID} -ne 0 ] && _red "This script must be run as root\n" && exit 1
 
 _red() {
     printf '\033[1;31;31m%b\033[0m' "$1"
@@ -61,13 +66,13 @@ _exists() {
     else
         which "$cmd" > /dev/null 2>&1
     fi
-    rt="$?"
+    local rt=$?
     return ${rt}
 }
 
 _ipv4() {
     local ipv4="$( ip addr | egrep -o '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | \
-                   egrep -v "^192\.168|^172\.1[6-9]\.|^172\.2[0-9]\.|^172\.3[0-2]\.|^10\.|^127\.|^255\.|^0\." | head -n 1 )"
+                   egrep -v "^192\.168|^172\.1[6-9]\.|^172\.2[0-9]\.|^172\.3[0-2]\.|^10\.|^127\.|^255\.|^0\.|^169\.254\." | head -n 1 )"
     [ -z "${ipv4}" ] && ipv4="$( wget -qO- -t1 -T2 ipv4.icanhazip.com )"
     [ -z "${ipv4}" ] && ipv4="$( wget -qO- -t1 -T2 ipinfo.io/ip )"
     printf -- "%s" "${ipv4}"
@@ -129,25 +134,54 @@ _version_gt(){
     test "$(echo "$@" | tr " " "\n" | sort -V | head -n 1)" != "$1"
 }
 
+_version_ge(){
+    test "$(echo "$@" | tr " " "\n" | sort -rV | head -n 1)" == "$1"
+}
+
 _is_installed() {
+    install_flag=(0 0)
     if _exists "wg" && _exists "wg-quick"; then
-        if [ -s "/lib/modules/$(uname -r)/extra/wireguard.ko" ] || [ -s "/lib/modules/$(uname -r)/extra/wireguard.ko.xz" ] \
-           || [ -s "/lib/modules/$(uname -r)/updates/dkms/wireguard.ko" ]; then
-            return 0
-        else
-            return 1
-        fi
-    else
+        install_flag[0]=1
+    fi
+    if [ -s "/lib/modules/$(uname -r)/extra/wireguard.ko" ] \
+    || [ -s "/lib/modules/$(uname -r)/extra/wireguard.ko.xz" ] \
+    || [ -s "/lib/modules/$(uname -r)/updates/dkms/wireguard.ko" ] \
+    || [ -s "/lib/modules/$(uname -r)/kernel/drivers/net/wireguard/wireguard.ko" ] \
+    || [ -s "/lib/modules/$(uname -r)/kernel/drivers/net/wireguard/wireguard.ko.xz" ]; then
+        install_flag[1]=1
+    fi
+    if [ "${install_flag[0]}" = "1" ] && [ "${install_flag[1]}" = "1" ]; then
+        return 0
+    fi
+    if [ "${install_flag[0]}" = "1" ] && [ "${install_flag[1]}" = "0" ]; then
+        return 1
+    fi
+    if [ "${install_flag[0]}" = "0" ] && [ "${install_flag[1]}" = "1" ]; then
         return 2
+    fi
+    if [ "${install_flag[0]}" = "0" ] && [ "${install_flag[1]}" = "0" ]; then
+        return 3
     fi
 }
 
-_get_latest_ver() {
-    wireguard_ver="$(wget --no-check-certificate -qO- https://api.github.com/repos/WireGuard/WireGuard/tags | grep 'name' | head -1 | cut -d\" -f4)"
+get_latest_module_ver() {
+    wireguard_ver="$(wget --no-check-certificate -qO- https://api.github.com/repos/WireGuard/wireguard-linux-compat/tags | grep 'name' | head -1 | cut -d\" -f4)"
     if [ -z "${wireguard_ver}" ]; then
-        wireguard_ver="$(curl -Lso- https://api.github.com/repos/WireGuard/WireGuard/tags | grep 'name' | head -1 | cut -d\" -f4)"
+        wireguard_ver="$(curl -Lso- https://api.github.com/repos/WireGuard/wireguard-linux-compat/tags | grep 'name' | head -1 | cut -d\" -f4)"
     fi
-    [ -z "${wireguard_ver}" ] && _error "Failed to get wireguard latest version from github"
+    if [ -z "${wireguard_ver}" ]; then
+        _error "Failed to get latest wireguard module version from github"
+    fi
+}
+
+get_latest_tools_ver() {
+    wireguard_tools_ver="$(wget --no-check-certificate -qO- https://api.github.com/repos/WireGuard/wireguard-tools/tags | grep 'name' | head -1 | cut -d\" -f4)"
+    if [ -z "${wireguard_tools_ver}" ]; then
+        wireguard_tools_ver="$(curl -Lso- https://api.github.com/repos/WireGuard/wireguard-tools/tags | grep 'name' | head -1 | cut -d\" -f4)"
+    fi
+    if [ -z "${wireguard_tools_ver}" ]; then
+        _error "Failed to get latest wireguard tools version from github"
+    fi
 }
 
 # Check OS version
@@ -164,13 +198,13 @@ check_os() {
     if [ -n "${virt}" -a "${virt}" = "openvz" ] || [ -d "/proc/vz" ]; then
         _error "Virtualization method is OpenVZ, which is not supported."
     fi
-    [ -z "$(_os)" ] && _error "Not supported OS."
+    [ -z "$(_os)" ] && _error "Not supported OS"
     case "$(_os)" in
         ubuntu)
             [ -n "$(_os_ver)" -a "$(_os_ver)" -lt 16 ] && _error "Not supported OS, please change to Ubuntu 16+ and try again."
             ;;
-        debian)
-            [ -n "$(_os_ver)" -a "$(_os_ver)" -lt 8 ] &&  _error "Not supported OS, please change to Debian 8+ and try again."
+        debian|raspbian)
+            [ -n "$(_os_ver)" -a "$(_os_ver)" -lt 8 ] &&  _error "Not supported OS, please change to De(Rasp)bian 8+ and try again."
             ;;
         fedora)
             [ -n "$(_os_ver)" -a "$(_os_ver)" -lt 29 ] && _error "Not supported OS, please change to Fedora 29+ and try again."
@@ -179,101 +213,233 @@ check_os() {
             [ -n "$(_os_ver)" -a "$(_os_ver)" -lt 7 ] &&  _error "Not supported OS, please change to CentOS 7+ and try again."
             ;;
         *)
-            ;; # do nothing
+            _error "Not supported OS"
+            ;;
     esac
 }
 
-# Install from repository
-install_wg_1() {
-    _info "Install wireguard from repository"
-    case "$(_os)" in
-        ubuntu)
-            _error_detect "add-apt-repository ppa:wireguard/wireguard"
-            _error_detect "apt-get update"
-            _error_detect "apt-get -y install linux-headers-$(uname -r)"
-            _error_detect "apt-get -y install qrencode"
-            _error_detect "apt-get -y install iptables"
-            _error_detect "apt-get -y install wireguard"
-            ;;
-        debian)
-            echo "deb http://deb.debian.org/debian/ unstable main" > /etc/apt/sources.list.d/unstable.list
-            printf 'Package: *\nPin: release a=unstable\nPin-Priority: 90\n' > /etc/apt/preferences.d/limit-unstable
-            _error_detect "apt-get update"
-            _error_detect "apt-get -y install linux-headers-$(uname -r)"
-            _error_detect "apt-get -y install qrencode"
-            _error_detect "apt-get -y install iptables"
-            _error_detect "apt-get -y install wireguard"
-            ;;
-        fedora)
-            _error_detect "dnf -y copr enable jdoss/wireguard"
-            _error_detect "dnf -y install kernel-devel"
-            _error_detect "dnf -y install kernel-headers"
-            _error_detect "dnf -y install qrencode"
-            _error_detect "dnf -y install wireguard-dkms wireguard-tools"
-            ;;
-        centos)
-            _error_detect "curl -Lso /etc/yum.repos.d/wireguard.repo https://copr.fedorainfracloud.org/coprs/jdoss/wireguard/repo/epel-7/jdoss-wireguard-epel-7.repo"
-            _error_detect "yum -y install epel-release"
-            _error_detect "yum -y install kernel-devel"
-            _error_detect "yum -y install kernel-headers"
-            _error_detect "yum -y install qrencode"
-            _error_detect "yum -y install wireguard-dkms wireguard-tools"
-            ;;
-        *)
-            ;; # do nothing
-    esac
-    if ! _is_installed; then
-        _error "Failed to install wireguard, the kernel is most likely not configured correctly"
+# Check linux kernel version
+check_kernel_version() {
+    kernel_version="$(uname -r | cut -d- -f1)"
+    if _version_ge ${kernel_version} 5.6.0; then
+        return 0
+    else
+        return 1
     fi
 }
 
-# Install from source
-install_wg_2() {
-    _info "Install wireguard from source"
+# Install wireguard module from source
+install_wg_module() {
+    get_latest_module_ver
+    wireguard_name="wireguard-linux-compat-$(echo ${wireguard_ver} | grep -oE '[0-9.]+')"
+    wireguard_url="https://github.com/WireGuard/wireguard-linux-compat/archive/${wireguard_ver}.tar.gz"
+    cd ${cur_dir}
+    _error_detect "wget --no-check-certificate -qO ${wireguard_name}.tar.gz ${wireguard_url}"
+    _error_detect "tar zxf ${wireguard_name}.tar.gz"
+    _error_detect "cd ${wireguard_name}/src"
+    _error_detect "make"
+    _error_detect "make install"
+    _error_detect "cd ${cur_dir} && rm -fr ${wireguard_name}.tar.gz ${wireguard_name}"
+}
+
+# Install wireguard tools from source
+install_wg_tools() {
+    get_latest_tools_ver
+    wireguard_tools_name="wireguard-tools-$(echo ${wireguard_tools_ver} | grep -oE '[0-9.]+')"
+    wireguard_tools_url="https://github.com/WireGuard/wireguard-tools/archive/${wireguard_tools_ver}.tar.gz"
+    cd ${cur_dir}
+    _error_detect "wget --no-check-certificate -qO ${wireguard_tools_name}.tar.gz ${wireguard_tools_url}"
+    _error_detect "tar zxf ${wireguard_tools_name}.tar.gz"
+    _error_detect "cd ${wireguard_tools_name}/src"
+    _error_detect "make"
+    _error_detect "make install"
+    _error_detect "cd ${cur_dir} && rm -fr ${wireguard_tools_name}.tar.gz ${wireguard_tools_name}"
+}
+
+install_wg_pkgs() {
+    _info "Install dependencies for wireguard"
     case "$(_os)" in
-        ubuntu|debian)
+        ubuntu|debian|raspbian)
             _error_detect "apt-get update"
-            [ ! -d "/usr/src/linux-headers-$(uname -r)" ] && _error_detect "apt-get -y install linux-headers-$(uname -r)"
             _error_detect "apt-get -y install qrencode"
             _error_detect "apt-get -y install iptables"
             _error_detect "apt-get -y install bc"
             _error_detect "apt-get -y install gcc"
             _error_detect "apt-get -y install make"
             _error_detect "apt-get -y install libmnl-dev"
+            _error_detect "apt-get -y install libelf-dev"
             ;;
         fedora)
-            [ ! -d "/usr/src/kernels/$(uname -r)" ] && _error_detect "dnf -y install kernel-headers" && _error_detect "dnf -y install kernel-devel"
             _error_detect "dnf -y install qrencode"
             _error_detect "dnf -y install bc"
             _error_detect "dnf -y install gcc"
             _error_detect "dnf -y install make"
             _error_detect "dnf -y install libmnl-devel"
+            _error_detect "dnf -y install elfutils-libelf-devel"
             ;;
         centos)
             _error_detect "yum -y install epel-release"
-            [ ! -d "/usr/src/kernels/$(uname -r)" ] && _error_detect "yum -y install kernel-headers" && _error_detect "yum -y install kernel-devel"
             _error_detect "yum -y install qrencode"
             _error_detect "yum -y install bc"
             _error_detect "yum -y install gcc"
             _error_detect "yum -y install make"
+            _error_detect "yum -y install yum-utils"
+            [ -n "$(_os_ver)" -a "$(_os_ver)" -eq 8 ] && _error_detect "yum-config-manager --enable PowerTools"
             _error_detect "yum -y install libmnl-devel"
+            _error_detect "yum -y install elfutils-libelf-devel"
             ;;
         *)
             ;; # do nothing
     esac
-    _get_latest_ver
-    wireguard_name="WireGuard-${wireguard_ver}"
-    wireguard_url="https://github.com/WireGuard/WireGuard/archive/${wireguard_ver}.tar.gz"
-    _error_detect "wget --no-check-certificate -qO ${wireguard_name}.tar.gz ${wireguard_url}"
-    _error_detect "tar zxf ${wireguard_name}.tar.gz"
-    _error_detect "cd ${wireguard_name}/src"
-    _error_detect "make tools"
-    _error_detect "make module"
-    _error_detect "make install"
-    _error_detect "cd ${cur_dir} && rm -fr ${wireguard_name}.tar.gz ${wireguard_name}"
+}
+
+# Install from repository
+install_wg_1() {
+    install_wg_pkgs
+    _info "Install wireguard from repository"
+    case "$(_os)" in
+        ubuntu)
+            _error_detect "add-apt-repository ppa:wireguard/wireguard"
+            _error_detect "apt-get update"
+            _error_detect "apt-get -y install linux-headers-$(uname -r)"
+            _error_detect "apt-get -y install wireguard-dkms"
+            _error_detect "apt-get -y install wireguard-tools"
+            ;;
+        debian)
+            echo "deb http://deb.debian.org/debian/ unstable main" > /etc/apt/sources.list.d/unstable.list
+            printf 'Package: *\nPin: release a=unstable\nPin-Priority: 90\n' > /etc/apt/preferences.d/limit-unstable
+            _error_detect "apt-get update"
+            _error_detect "apt-get -y install linux-headers-$(uname -r)"
+            _error_detect "apt-get -y install wireguard-dkms"
+            _error_detect "apt-get -y install wireguard-tools"
+            ;;
+        fedora)
+            _error_detect "dnf -y copr enable jdoss/wireguard"
+            _error_detect "dnf -y install kernel-devel"
+            _error_detect "dnf -y install kernel-headers"
+            _error_detect "dnf -y install wireguard-dkms"
+            _error_detect "dnf -y install wireguard-tools"
+            ;;
+        centos)
+            if [ -n "$(_os_ver)" -a "$(_os_ver)" -eq 7 ]; then
+                _error_detect "curl -Lso /etc/yum.repos.d/wireguard.repo https://copr.fedorainfracloud.org/coprs/jdoss/wireguard/repo/epel-7/jdoss-wireguard-epel-7.repo"
+            fi
+            if [ -n "$(_os_ver)" -a "$(_os_ver)" -eq 8 ]; then
+                _error_detect "curl -Lso /etc/yum.repos.d/wireguard.repo https://copr.fedorainfracloud.org/coprs/jdoss/wireguard/repo/epel-8/jdoss-wireguard-epel-8.repo"
+            fi
+            _error_detect "yum -y install kernel-devel"
+            _error_detect "yum -y install kernel-headers"
+            _error_detect "yum -y install wireguard-dkms"
+            _error_detect "yum -y install wireguard-tools"
+            ;;
+        *)
+            ;; # do nothing
+    esac
+}
+
+# Install from source
+install_wg_2() {
+    install_wg_pkgs
+    _info "Install wireguard from source"
+    case "$(_os)" in
+        ubuntu|debian|raspbian)
+            if [ ! -d "/usr/src/linux-headers-$(uname -r)" ]; then
+                if [ "$(_os)" = "raspbian" ]; then
+                    _error_detect "apt-get -y install raspberrypi-kernel-headers"
+                else
+                    _error_detect "apt-get -y install linux-headers-$(uname -r)"
+                fi
+            fi
+            ;;
+        fedora)
+            [ ! -d "/usr/src/kernels/$(uname -r)" ] && _error_detect "dnf -y install kernel-headers" && _error_detect "dnf -y install kernel-devel"
+            ;;
+        centos)
+            [ ! -d "/usr/src/kernels/$(uname -r)" ] && _error_detect "yum -y install kernel-headers" && _error_detect "yum -y install kernel-devel"
+            ;;
+        *)
+            ;; # do nothing
+    esac
+    install_wg_module
+    install_wg_tools
+}
+
+# Install wireguard tools from repo
+install_wg_3() {
+    install_wg_pkgs
+    _info "Install wireguard from repository"
+    case "$(_os)" in
+        ubuntu)
+            _error_detect "add-apt-repository ppa:wireguard/wireguard"
+            _error_detect "apt-get update"
+            _error_detect "apt-get -y install --no-install-recommends wireguard-tools"
+            ;;
+        debian)
+            echo "deb http://deb.debian.org/debian/ unstable main" > /etc/apt/sources.list.d/unstable.list
+            printf 'Package: *\nPin: release a=unstable\nPin-Priority: 90\n' > /etc/apt/preferences.d/limit-unstable
+            _error_detect "apt-get update"
+            _error_detect "apt-get -y install --no-install-recommends wireguard-tools"
+            ;;
+        fedora)
+            _error_detect "dnf -y copr enable jdoss/wireguard"
+            _error_detect "dnf -y install wireguard-tools"
+            ;;
+        centos)
+            if [ -n "$(_os_ver)" -a "$(_os_ver)" -eq 7 ]; then
+                _error_detect "curl -Lso /etc/yum.repos.d/wireguard.repo https://copr.fedorainfracloud.org/coprs/jdoss/wireguard/repo/epel-7/jdoss-wireguard-epel-7.repo"
+            fi
+            if [ -n "$(_os_ver)" -a "$(_os_ver)" -eq 8 ]; then
+                _error_detect "curl -Lso /etc/yum.repos.d/wireguard.repo https://copr.fedorainfracloud.org/coprs/jdoss/wireguard/repo/epel-8/jdoss-wireguard-epel-8.repo"
+            fi
+            _error_detect "yum -y install wireguard-tools"
+            ;;
+        *)
+            ;; # do nothing
+    esac
+}
+
+# Install wireguard tools from source
+install_wg_4() {
+    install_wg_pkgs
+    _info "Install wireguard tools from source"
+    install_wg_tools
+}
+
+# Uninstall WireGuard
+uninstall_wg() {
     if ! _is_installed; then
-        _error "Failed to install wireguard, the kernel is most likely not configured correctly"
+        _error "WireGuard is not installed"
     fi
+    _info "Uninstall WireGuard start"
+    # stop wireguard at first
+    _error_detect "systemctl stop wg-quick@${SERVER_WG_NIC}"
+    _error_detect "systemctl disable wg-quick@${SERVER_WG_NIC}"
+    # if wireguard has been installed from repository
+    if _exists "yum" && _exists "rpm"; then
+        if rpm -qa | grep -q wireguard-dkms; then
+            _error_detect "yum -y remove wireguard-dkms"
+        fi
+        if rpm -qa | grep -q wireguard-tools; then
+            _error_detect "yum -y remove wireguard-tools"
+        fi
+    elif _exists "apt" && _exists "apt-get"; then
+        if apt list --installed | grep -q wireguard-dkms; then
+            _error_detect "apt-get -y remove wireguard-dkms"
+        fi
+        if apt list --installed | grep -q wireguard-tools; then
+            _error_detect "apt-get -y remove wireguard-tools"
+        fi
+    fi
+    # if wireguard has been installed from source
+    if _is_installed; then
+        _error_detect "rm -f /usr/bin/wg"
+        _error_detect "rm -f /usr/bin/wg-quick"
+        _error_detect "rm -f /usr/share/man/man8/wg.8"
+        _error_detect "rm -f /usr/share/man/man8/wg-quick.8"
+        _exists "modprobe" && _error_detect "modprobe -r wireguard"
+    fi
+    [ -d "/etc/wireguard" ] && _error_detect "rm -fr /etc/wireguard"
+    _info "Uninstall WireGuard completed"
 }
 
 # Create server interface
@@ -319,28 +485,28 @@ create_client_if() {
     if [ -n "${SERVER_PUB_IPV6}" ]; then
         cat > /etc/wireguard/${SERVER_WG_NIC}_client <<EOF
 [Interface]
-Address = ${CLIENT_WG_IPV4}/24,${CLIENT_WG_IPV6}/64
 PrivateKey = ${CLIENT_PRIVATE_KEY}
+Address = ${CLIENT_WG_IPV4}/24,${CLIENT_WG_IPV6}/64
 DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
 
 [Peer]
 PublicKey = ${SERVER_PUBLIC_KEY}
-Endpoint = ${SERVER_PUB_IPV4}:${SERVER_WG_PORT}
-AllowedIPs = 0.0.0.0/0,::/0
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+AllowedIPs = 0.0.0.0/0,::/0
+Endpoint = ${SERVER_PUB_IPV4}:${SERVER_WG_PORT}
 EOF
     else
         cat > /etc/wireguard/${SERVER_WG_NIC}_client <<EOF
 [Interface]
-Address = ${CLIENT_WG_IPV4}/24
 PrivateKey = ${CLIENT_PRIVATE_KEY}
+Address = ${CLIENT_WG_IPV4}/24
 DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
 
 [Peer]
 PublicKey = ${SERVER_PUBLIC_KEY}
-Endpoint = ${SERVER_PUB_IPV4}:${SERVER_WG_PORT}
-AllowedIPs = 0.0.0.0/0
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+AllowedIPs = 0.0.0.0/0
+Endpoint = ${SERVER_PUB_IPV4}:${SERVER_WG_PORT}
 EOF
     fi
     chmod 600 /etc/wireguard/${SERVER_WG_NIC}_client
@@ -366,7 +532,7 @@ enable_ip_forward() {
 set_firewall() {
     _info "Setting firewall rules"
     if _exists "firewall-cmd"; then
-        if [ "$(firewall-cmd --state | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g")" = "running" ]; then
+        if firewall-cmd --state > /dev/null 2>&1; then
             default_zone="$(firewall-cmd --get-default-zone)"
             if [ "$(firewall-cmd --zone=${default_zone} --query-masquerade)" = "no" ]; then
                 _error_detect "firewall-cmd --permanent --zone=${default_zone} --add-masquerade"
@@ -376,7 +542,12 @@ set_firewall() {
             fi
             _error_detect "firewall-cmd --reload"
         else
-            _warn "Firewalld looks like not running, please start it and manually set"
+            _warn "Firewalld service unit is not running, please start it and manually set"
+            _warn "Maybe you need to run these commands like below:"
+            _warn "systemctl start firewalld"
+            _warn "firewall-cmd --permanent --zone=public --add-masquerade"
+            _warn "firewall-cmd --permanent --zone=public --add-port=${SERVER_WG_PORT}/udp"
+            _warn "firewall-cmd --reload"
         fi
     else
         if _exists "iptables"; then
@@ -415,11 +586,16 @@ install_completed() {
     _error_detect "systemctl start wg-quick@${SERVER_WG_NIC}"
     _error_detect "systemctl enable wg-quick@${SERVER_WG_NIC}"
     _info "WireGuard VPN Server installation completed"
+    _info ""
     _info "WireGuard VPN default client file is below:"
     _info "$(_green "/etc/wireguard/${SERVER_WG_NIC}_client")"
+    _info ""
     _info "WireGuard VPN default client QR Code is below:"
     _info "$(_green "/etc/wireguard/${SERVER_WG_NIC}_client.png")"
-    _info "Download and scan this QR Code with your phone, enjoy it"
+    _info ""
+    _info "Download and scan this QR Code with your device"
+    _info "Welcome to visit: https://teddysun.com/554.html"
+    _info "Enjoy it"
 }
 
 add_client() {
@@ -447,7 +623,7 @@ add_client() {
         fi
     done
     # Get information from default interface file
-    client_files=($(find /etc/wireguard -name "*_client" | sort))
+    client_files=($(find /etc/wireguard/ -name "*_client" | sort))
     client_ipv4=()
     client_ipv6=()
     for ((i=0; i<${#client_files[@]}; i++)); do
@@ -457,11 +633,11 @@ add_client() {
         client_ipv6=(${client_ipv6[@]} ${tmp_ipv6})
     done
     # Sort array
-    client_ipv4_sorted=($(printf '%s\n' "${client_ipv4[@]}" | sort))
+    client_ipv4_sorted=($(printf '%s\n' "${client_ipv4[@]}" | sort -V))
     index=$(expr ${#client_ipv4[@]} - 1)
     last_ip=$(echo ${client_ipv4_sorted[$index]} | cut -d. -f4)
     issue_ip_last=$(expr ${last_ip} + 1)
-    [ ${issue_ip_last} -gt 254 ] && _red "Too many client, IP addresses might not be enough\n" && exit 1
+    [ ${issue_ip_last} -gt 254 ] && _red "Too many clients, IP addresses might be not enough\n" && exit 1
     ipv4_comm=$(echo ${client_ipv4[$index]} | cut -d. -f1-3)
     ipv6_comm=$(echo ${client_ipv6[$index]} | awk -F: '{print $1":"$2":"$3":"$4}')
     CLIENT_PRIVATE_KEY="$(wg genkey)"
@@ -475,15 +651,15 @@ add_client() {
     if [ -n "${SERVER_PUB_IPV6}" ]; then
         cat > ${new_client_if} <<EOF
 [Interface]
-Address = ${CLIENT_WG_IPV4}/24,${CLIENT_WG_IPV6}/64
 PrivateKey = ${CLIENT_PRIVATE_KEY}
+Address = ${CLIENT_WG_IPV4}/24,${CLIENT_WG_IPV6}/64
 DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
 
 [Peer]
 PublicKey = ${SERVER_PUBLIC_KEY}
-Endpoint = ${CLIENT_ENDPOINT}
-AllowedIPs = 0.0.0.0/0,::/0
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+AllowedIPs = 0.0.0.0/0,::/0
+Endpoint = ${CLIENT_ENDPOINT}
 EOF
         # Add a new client to default server interface
         cat >> ${default_server_if} <<EOF
@@ -496,15 +672,15 @@ EOF
     else
         cat > ${new_client_if} <<EOF
 [Interface]
-Address = ${CLIENT_WG_IPV4}/24
 PrivateKey = ${CLIENT_PRIVATE_KEY}
+Address = ${CLIENT_WG_IPV4}/24
 DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
 
 [Peer]
 PublicKey = ${SERVER_PUBLIC_KEY}
-Endpoint = ${CLIENT_ENDPOINT}
-AllowedIPs = 0.0.0.0/0
 PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+AllowedIPs = 0.0.0.0/0
+Endpoint = ${CLIENT_ENDPOINT}
 EOF
         cat >> ${default_server_if} <<EOF
 
@@ -526,7 +702,7 @@ EOF
     echo
     echo "WireGuard VPN new client ($(_green ${client})) QR Code is below:"
     _green "/etc/wireguard/${client}_client.png\n"
-    echo "Download and scan this QR Code with your phone, enjoy it"
+    echo "Download and scan this QR Code with your device, enjoy it"
 }
 
 remove_client() {
@@ -568,7 +744,7 @@ list_clients() {
     local line="+-------------------------------------------------------------------------+\n"
     local string=%-35s
     printf "${line}|${string} |${string} |\n${line}" " Client Interface" " Client's IP"
-    client_files=($(find /etc/wireguard -name "*_client" | sort))
+    client_files=($(find /etc/wireguard/ -name "*_client" | sort))
     ips=($(grep -w "AllowedIPs" ${default_server_if} | awk '{print $3}'))
     [ ${#client_files[@]} -ne ${#ips[@]} ] && echo "One or more client interface file is missing in /etc/wireguard" && exit 1
     for ((i=0; i<${#ips[@]}; i++)); do
@@ -588,11 +764,16 @@ check_version() {
     rt=$?
     if [ ${rt} -eq 0 ]; then
         _exists "modinfo" && installed_wg_ver="$(modinfo -F version wireguard)"
-        [ -n "${installed_wg_ver}" ] && echo "WireGuard version: $(_green ${installed_wg_ver})" && return 0
+        [ -n "${installed_wg_ver}" ] && echo "wireguard-dkms version : $(_green ${installed_wg_ver})"
+        installed_wg_tools_ver="$(wg --version | awk '{print $2}' | grep -oE '[0-9.]+')"
+        [ -n "${installed_wg_tools_ver}" ] && echo "wireguard-tools version: $(_green ${installed_wg_tools_ver})"
+        return 0
     elif [ ${rt} -eq 1 ]; then
-        _red "WireGuard kernel module does not exists\n" && return 1
+        _red "WireGuard tools is exist, but WireGuard module does not exists\n" && return 1
     elif [ ${rt} -eq 2 ]; then
-        _red "WireGuard was not installed\n" && return 2
+        _red "WireGuard module is exist, but WireGuard tools does not exists\n" && return 2
+    elif [ ${rt} -eq 3 ]; then
+        _red "WireGuard was not installed\n" && return 3
     fi
 }
 
@@ -608,14 +789,27 @@ Options:
         -a, --add        Add a WireGuard client
         -d, --del        Delete a WireGuard client
         -l, --list       List all WireGuard client's IP
+        -n, --uninstall  Uninstall WireGuard
 
 "
 }
 
 install_from_repo() {
-    _is_installed && check_version && _red "WireGuard was already installed\n" && exit 0
+    _is_installed
+    rt=$?
+    if [ ${rt} -eq 0 ]; then
+        _red "WireGuard was already installed\n" && exit 0
+    fi
     check_os
-    install_wg_1
+    if check_kernel_version; then
+        if [ ${rt} -eq 2 ]; then
+            install_wg_3
+        else
+            _error "WireGuard module does not exists, please check your kernel"
+        fi
+    else
+        install_wg_1
+    fi
     create_server_if
     create_client_if
     generate_qr
@@ -625,9 +819,21 @@ install_from_repo() {
 }
 
 install_from_source() {
-    _is_installed && check_version && _red "WireGuard was already installed\n" && exit 0
+    _is_installed
+    rt=$?
+    if [ ${rt} -eq 0 ]; then
+        _red "WireGuard was already installed\n" && exit 0
+    fi
     check_os
-    install_wg_2
+    if check_kernel_version; then
+        if [ ${rt} -eq 2 ]; then
+            install_wg_4
+        else
+            _error "WireGuard module does not exists, please check your kernel"
+        fi
+    else
+        install_wg_2
+    fi
     create_server_if
     create_client_if
     generate_qr
@@ -638,37 +844,43 @@ install_from_source() {
 
 update_from_source() {
     if check_version > /dev/null 2>&1; then
-        _get_latest_ver
-        _info "WireGuard version: $(_green ${installed_wg_ver})"
-        _info "WireGuard latest version: $(_green ${wireguard_ver})"
-        if _version_gt "${wireguard_ver}" "${installed_wg_ver}"; then
-            _info "Starting upgrade WireGuard"
-            install_wg_2
-            _error_detect "systemctl restart wg-quick@${SERVER_WG_NIC}"
-            _info "Update WireGuard completed"
+        restart_flg=0
+        get_latest_module_ver
+        wg_ver="$(echo ${wireguard_ver} | grep -oE '[0-9.]+')"
+        _info "wireguard-dkms version: $(_green ${installed_wg_ver})"
+        _info "wireguard-dkms latest version: $(_green ${wg_ver})"
+        if check_kernel_version; then
+            _info "wireguard-dkms has been merged into Linux >= 5.6 and therefore this compatibility module is no longer required"
         else
-            _info "There is no update available for WireGuard"
+            if _version_gt "${wg_ver}" "${installed_wg_ver}"; then
+                _info "Starting upgrade wireguard-dkms"
+                install_wg_module
+                _info "Update wireguard-dkms completed"
+                restart_flg=1
+            else
+                _info "There is no update available for wireguard-dkms"
+            fi
+        fi
+        get_latest_tools_ver
+        wg_tools_ver="$(echo ${wireguard_tools_ver} | grep -oE '[0-9.]+')"
+        _info "wireguard-tools version: $(_green ${installed_wg_tools_ver})"
+        _info "wireguard-tools latest version: $(_green ${wg_tools_ver})"
+        if _version_gt "${wg_tools_ver}" "${installed_wg_tools_ver}"; then
+            _info "Starting upgrade wireguard-tools"
+            install_wg_tools
+            _info "Update wireguard-tools completed"
+            restart_flg=1
+        else
+            _info "There is no update available for wireguard-tools"
+        fi
+        if [ ${restart_flg} -eq 1 ]; then
+            _error_detect "systemctl daemon-reload"
+            _error_detect "systemctl restart wg-quick@${SERVER_WG_NIC}"
         fi
     else
         _red "WireGuard was not installed, maybe you need to install it at first\n"
     fi
 }
-
-cur_dir="$(pwd)"
-
-[ ${EUID} -ne 0 ] && _red "This script must be run as root\n" && exit 1
-
-SERVER_PUB_IPV4="${VPN_SERVER_PUB_IPV4:-$(_ipv4)}"
-SERVER_PUB_IPV6="${VPN_SERVER_PUB_IPV6:-$(_ipv6)}"
-SERVER_PUB_NIC="${VPN_SERVER_PUB_NIC:-$(_nic)}"
-SERVER_WG_NIC="${VPN_SERVER_WG_NIC:-wg0}"
-SERVER_WG_IPV4="${VPN_SERVER_WG_IPV4:-10.88.88.1}"
-SERVER_WG_IPV6="${VPN_SERVER_WG_IPV6:-fd88:88:88::1}"
-SERVER_WG_PORT="${VPN_SERVER_WG_PORT:-$(_port)}"
-CLIENT_WG_IPV4="${VPN_CLIENT_WG_IPV4:-10.88.88.2}"
-CLIENT_WG_IPV6="${VPN_CLIENT_WG_IPV6:-fd88:88:88::2}"
-CLIENT_DNS_1="${VPN_CLIENT_DNS_1:-1.1.1.1}"
-CLIENT_DNS_2="${VPN_CLIENT_DNS_2:-8.8.8.8}"
 
 main() {
     action="$1"
@@ -698,10 +910,25 @@ main() {
         -l|--list)
             list_clients
             ;;
+        -n|--uninstall)
+            uninstall_wg
+            ;;
         *)
             show_help
             ;;
     esac
 }
+
+SERVER_PUB_IPV4="${VPN_SERVER_PUB_IPV4:-$(_ipv4)}"
+SERVER_PUB_IPV6="${VPN_SERVER_PUB_IPV6:-$(_ipv6)}"
+SERVER_PUB_NIC="${VPN_SERVER_PUB_NIC:-$(_nic)}"
+SERVER_WG_NIC="${VPN_SERVER_WG_NIC:-wg0}"
+SERVER_WG_IPV4="${VPN_SERVER_WG_IPV4:-10.88.88.1}"
+SERVER_WG_IPV6="${VPN_SERVER_WG_IPV6:-fd88:88:88::1}"
+SERVER_WG_PORT="${VPN_SERVER_WG_PORT:-$(_port)}"
+CLIENT_WG_IPV4="${VPN_CLIENT_WG_IPV4:-10.88.88.2}"
+CLIENT_WG_IPV6="${VPN_CLIENT_WG_IPV6:-fd88:88:88::2}"
+CLIENT_DNS_1="${VPN_CLIENT_DNS_1:-1.1.1.1}"
+CLIENT_DNS_2="${VPN_CLIENT_DNS_2:-8.8.8.8}"
 
 main "$@"
